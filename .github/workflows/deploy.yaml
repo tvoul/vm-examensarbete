@@ -1,0 +1,133 @@
+name: Deploy and configure virtual machine on Azure
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Prepare SSH public key for virtual machine
+      run: echo "${{ secrets.SSH_PUBLIC_KEY }}" > ssh_public_key
+
+    - name: Create resource group
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az group create \
+          -l swedencentral \
+          -n demo-vm-rg
+
+    - name: Deploy virtual machine
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az vm create \
+            --resource-group demo-vm-rg \
+            --name demo-vm \
+            --image UbuntuLTS  \
+            --size Standard_B1ls \
+            --location swedencentral \
+            --storage-sku Standard_LRS \
+            --ssh-key-values "@./ssh_public_key"
+    
+    - name: Open port 3000 for vm
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az vm open-port \
+          --port 3000 \
+          --resource-group demo-vm-rg \
+          --name demo-vm
+
+    - name: Get public IP address of vm
+      id: public_ip
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          public_ip=$(az vm show -d -g demo-vm-rg -n demo-vm --query publicIps -o tsv)
+          echo "::set-output name=public_ip::$public_ip"
+
+    - name: Configure SSH to access vm
+      run: |
+        mkdir -p ~/.ssh/
+        echo "$SSH_KEY" > ~/.ssh/dev.key
+        chmod 600 ~/.ssh/dev.key
+        cat >>~/.ssh/config <<END
+        Host dev
+          HostName $SSH_HOST
+          User $SSH_USER
+          Port $SSH_PORT
+          IdentityFile ~/.ssh/dev.key
+          StrictHostKeyChecking no
+        END
+      env:
+        SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_HOST: ${{ steps.public_ip.outputs.public_ip }}
+        SSH_USER: ${{ secrets.SSH_USER }}
+        SSH_PORT: ${{ secrets.SSH_PORT }}
+
+    - name: Download node
+      run: |
+        ssh dev 'sudo apt update && curl -sL https://deb.nodesource.com/setup_16.x | sudo bash -'
+
+    - name: Sleep
+      run: sleep 30s
+      shell: bash
+    
+    - name: Install node
+      run: |
+        ssh dev 'sudo apt -y install nodejs'
+    
+    - name: Sleep
+      run: sleep 30s
+      shell: bash
+    
+    - name: Install pm2
+      run: |
+        ssh dev 'sudo npm install -g pm2'
+
+    - name: Clone repo
+      run: |
+        ssh dev 'git clone https://github.com/tvoul/vm-examensarbete.git'
+    
+    - name: npm install
+      run: |
+        ssh dev 'cd vm-examensarbete/ && npm i'
+    
+    - name: Sleep
+      run: sleep 30s
+      shell: bash
+
+    - name: Start app
+      run: |
+        ssh dev 'cd vm-examensarbete && pm2 start backend/index.js'
+
+    - name: Trigger Logic App
+      run: |
+        tenantId=$(echo "${{ secrets.AZURE_CREDENTIALS }}" | grep '"tenantId"' | sed 's/.*: "\(.*\)".*/\1/')
+        clientId=$(echo "${{ secrets.AZURE_CREDENTIALS }}" | grep '"clientId"' | sed 's/.*: "\(.*\)".*/\1/')
+        clientSecret=$(echo "${{ secrets.AZURE_CREDENTIALS }}" | grep '"clientSecret"' | sed 's/.*: "\(.*\)".*/\1/')
+        resource="https://management.azure.com/"
+
+        url="https://login.microsoftonline.com/$tenantId/oauth2/token"
+        body="grant_type=client_credentials&client_id=$clientId&client_secret=$clientSecret&resource=$resource"
+
+        response=$(curl -sS -X POST -d "$body" -H "Content-Type: application/x-www-form-urlencoded" $url)
+        sas_token=$(echo $response | jq -r .access_token)
+
+        curl -X POST -H "Content-Type: application/json" -d '{"public_ip": "'"${{ steps.public_ip.outputs.public_ip }}"'"}' "${{ secrets.LOGIC_APP_URL }}&Authorization=${sas_token}"
+    
+    - name: Logout of Azure
+      run: |
+        az logout
